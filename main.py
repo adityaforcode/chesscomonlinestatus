@@ -35,6 +35,7 @@ def home():
     return "Bot is running ✅"
 
 # === UTILITY FUNCTIONS ===
+
 def send_telegram_message(text, chat_id):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     data = {"chat_id": chat_id, "text": text}
@@ -66,7 +67,6 @@ def send_telegram_document(file_path, chat_id):
         except Exception as e:
             print(f"[!] Error sending document: {e}")
 
-
 def save_user_data():
     try:
         payload = {
@@ -96,40 +96,32 @@ def load_user_data():
                     print("[INFO] Found db.json in Telegram updates.")
                     file_id = doc.get("file_id")
 
-                    # Get file path
                     file_info = requests.get(
                         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile?file_id={file_id}"
                     ).json()
                     file_path = file_info["result"]["file_path"]
 
-                    # Download file
                     file_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
                     file_content = requests.get(file_url).content
 
-                    # Load JSON content
                     data = json.loads(file_content)
 
                     user_monitored = defaultdict(list, data.get("user_monitored", {}))
                     PER_USER_LIMITS.update(data.get("limits", {}))
                     AUTHORIZED_USERS = set(data.get("authorized_users", []))
 
-                    # Restore latest known message ID for overwrite/delete
                     LATEST_DB_MESSAGE_ID = message.get("message_id")
 
-                    # Rebuild full monitored username list
                     for usernames in user_monitored.values():
                         all_monitored_usernames.update(usernames)
 
                     print("[✅] Successfully restored data from db.json")
-                    print(f"[DEBUG] Authorized Users: {AUTHORIZED_USERS}")
-                    print(f"[DEBUG] Monitored Users: {user_monitored}")
                     return
 
         print("[!] No db.json found in Telegram channel history.")
 
     except Exception as e:
         print(f"[!] Failed to load data from Telegram channel: {e}")
-
 
 def convert_unix_to_ist(unix_timestamp):
     if not unix_timestamp:
@@ -150,12 +142,14 @@ def get_user_data(username):
         r1 = requests.get(uuid_url, headers=HEADERS, timeout=5)
         if r1.status_code == 200:
             uuid = r1.json().get("uuid")
-    except: pass
+    except:
+        pass
     try:
         r2 = requests.get(online_url, headers=HEADERS, timeout=5)
         if r2.status_code == 200:
             last_online_unix = r2.json().get("last_online")
-    except: pass
+    except:
+        pass
     return {"uuid": uuid, "last_online_unix": last_online_unix}
 
 def get_presence_data(uuid):
@@ -166,7 +160,8 @@ def get_presence_data(uuid):
             users = resp.json().get("users", [])
             if users:
                 return users[0]
-    except: pass
+    except:
+        pass
     return None
 
 # === MONITORING LOOP ===
@@ -212,7 +207,6 @@ def handle_commands():
                     if not text:
                         continue
 
-                    # === AUTHORIZATION ===
                     if text.startswith("/authorize") and user_id == BOT_ADMIN_ID:
                         parts = text.split()
                         if len(parts) == 2:
@@ -235,10 +229,10 @@ def handle_commands():
                         parts = text.split()
                         if len(parts) == 2:
                             username = parts[1].lower()
-                            if username in all_monitored_usernames:
-                                send_telegram_message("⚠ Username already being monitored.", chat_id)
-                                continue
                             current = user_monitored[user_id]
+                            if username in current:
+                                send_telegram_message("⚠ You are already monitoring this username.", chat_id)
+                                continue
                             limit = PER_USER_LIMITS.get(user_id, MAX_USERNAMES_PER_USER)
                             if len(current) >= limit:
                                 send_telegram_message("⚠ Limit reached.", chat_id)
