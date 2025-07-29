@@ -10,12 +10,12 @@ import json
 
 # === CONFIGURATION ===
 AUTHORIZED_USERS = set()
-BOT_ADMIN_ID = os.getenv("BOT_ADMIN_ID", "5643042263")
+BOT_ADMIN_ID = os.getenv("BOT_ADMIN_ID", "")
 MAX_USERNAMES_PER_USER = 10
 PER_USER_LIMITS = {}
 DB_CHANNEL_ID = os.getenv("DB_CHANNEL_ID", "-1002688118367")
 CHECK_INTERVAL = 60
-TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN", "8324291681:AAHW-sNueXw63KC_8QJZmr37xIQUm_napQw").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/115.0.0.0 Safari/537.36"
 }
