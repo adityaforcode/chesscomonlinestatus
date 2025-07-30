@@ -7,6 +7,7 @@ from flask import Flask
 import os
 from collections import defaultdict
 import json
+import re
 
 # === CONFIGURATION ===
 BOT_ADMIN_ID = os.getenv("BOT_ADMIN_ID", "")
@@ -44,6 +45,11 @@ def home():
 
 # === UTILITY FUNCTIONS ===
 
+def escape_markdown(text):
+    """Escapes characters for Telegram's MarkdownV2 parse mode."""
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', str(text))
+
 def send_telegram_message(text, chat_id, parse_mode=""):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     data = {"chat_id": chat_id, "text": text}
@@ -55,13 +61,14 @@ def send_telegram_message(text, chat_id, parse_mode=""):
         print(f"[!] Telegram send message error: {e}")
 
 def send_telegram_document(file_path, chat_id):
+    """Sends the db.json file and pins it in the channel."""
     global LATEST_DB_MESSAGE_ID
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
 
-    # Delete the previous database message if we know its ID
+    # Unpin the previous database message if we know its ID
     if LATEST_DB_MESSAGE_ID:
-        delete_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteMessage"
-        requests.post(delete_url, data={"chat_id": chat_id, "message_id": LATEST_DB_MESSAGE_ID})
+        unpin_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/unpinChatMessage"
+        requests.post(unpin_url, data={"chat_id": chat_id, "message_id": LATEST_DB_MESSAGE_ID})
 
     with open(file_path, 'rb') as f:
         files = {'document': f}
@@ -70,22 +77,27 @@ def send_telegram_document(file_path, chat_id):
             response = requests.post(url, files=files, data=data, timeout=10)
             if response.ok:
                 result = response.json().get("result", {})
-                # This write access to a global var should be inside the lock
-                # that calls save_user_data()
-                LATEST_DB_MESSAGE_ID = result.get("message_id")
-                print(f"[INFO] New DB saved with message ID: {LATEST_DB_MESSAGE_ID}")
+                new_message_id = result.get("message_id")
+                if new_message_id:
+                    # This write access is part of the save operation, protected by the calling lock
+                    LATEST_DB_MESSAGE_ID = new_message_id
+                    pin_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/pinChatMessage"
+                    pin_data = {"chat_id": chat_id, "message_id": new_message_id, "disable_notification": True}
+                    requests.post(pin_url, data=pin_data)
+                    print(f"[INFO] New DB saved and pinned with message ID: {LATEST_DB_MESSAGE_ID}")
             else:
                 print(f"[!] Failed to send file: {response.text}")
         except Exception as e:
             print(f"[!] Error sending document: {e}")
 
 def save_user_data():
-    # This function should only be called from within a `with STATE_LOCK:` block
+    """This function should only be called from within a `with STATE_LOCK:` block."""
     try:
         payload = {
             "user_monitored": {uid: list(usernames) for uid, usernames in user_monitored.items()},
             "limits": PER_USER_LIMITS,
-            "authorized_users": list(AUTHORIZED_USERS)
+            "authorized_users": list(AUTHORIZED_USERS),
+            "latest_db_message_id": LATEST_DB_MESSAGE_ID
         }
         with open("db.json", "w") as f:
             json.dump(payload, f)
@@ -94,59 +106,50 @@ def save_user_data():
             send_telegram_document("db.json", DB_CHANNEL_ID)
         else:
             print("[WARN] DB_CHANNEL_ID not set. Not saving to Telegram.")
-
     except Exception as e:
         print(f"[!] Failed to save data: {e}")
 
 def load_user_data():
+    """Loads user data from the pinned message in the Telegram channel."""
     global user_monitored, PER_USER_LIMITS, AUTHORIZED_USERS, LATEST_DB_MESSAGE_ID
-    print("[INFO] Attempting to load data from Telegram channel...")
+    print("[INFO] Attempting to load data from pinned message in Telegram channel...")
 
     if not DB_CHANNEL_ID:
-        print("[WARN] CRITICAL: DB_CHANNEL_ID environment variable is not set or empty. Skipping data load.")
+        print("[WARN] CRITICAL: DB_CHANNEL_ID not set. Skipping data load.")
         return
 
     try:
-        print(f"[DEBUG] Using Channel ID: {DB_CHANNEL_ID}")
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getChatHistory?chat_id={DB_CHANNEL_ID}&limit=10"
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getChat?chat_id={DB_CHANNEL_ID}"
         resp = requests.get(url, timeout=10).json()
 
-        # --- THIS IS THE CRUCIAL DEBUGGING PART ---
-        print("--- START TELEGRAM API RESPONSE ---")
-        import json
-        print(json.dumps(resp, indent=2))
-        print("--- END TELEGRAM API RESPONSE ---")
-        # -----------------------------------------
+        if not (resp.get("ok") and "result" in resp and "pinned_message" in resp.get("result", {})):
+            print("[!] No pinned message found in the channel. Starting fresh.")
+            return
 
-        if resp.get("ok") and "result" in resp:
-            if not resp["result"]:
-                print("[!] API call was successful, but the 'result' from Telegram is an empty list. No messages were returned.")
-                return
+        pinned_message = resp["result"]["pinned_message"]
+        doc = pinned_message.get("document")
 
-            for message in resp["result"]:
-                doc = message.get("document")
-                if doc and doc.get("file_name") == "db.json":
-                    print("[INFO] Found db.json in Telegram history.")
-                    file_id = doc["file_id"]
-                    
-                    file_info_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile?file_id={file_id}"
-                    file_info_resp = requests.get(file_info_url).json()
-                    file_path = file_info_resp["result"]["file_path"]
+        if doc and doc.get("file_name") == "db.json":
+            print("[INFO] Found db.json in pinned message.")
+            file_id = doc["file_id"]
+            
+            file_info_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile?file_id={file_id}"
+            file_info_resp = requests.get(file_info_url).json()
+            file_path = file_info_resp["result"]["file_path"]
 
-                    file_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
-                    file_content = requests.get(file_url).content
-                    data = json.loads(file_content)
+            file_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+            file_content = requests.get(file_url).content
+            data = json.loads(file_content)
 
-                    with STATE_LOCK:
-                        user_monitored = defaultdict(set, {uid: set(usernames) for uid, usernames in data.get("user_monitored", {}).items()})
-                        PER_USER_LIMITS.update(data.get("limits", {}))
-                        AUTHORIZED_USERS = set(data.get("authorized_users", []))
-                        LATEST_DB_MESSAGE_ID = message.get("message_id")
+            with STATE_LOCK:
+                user_monitored = defaultdict(set, {uid: set(usernames) for uid, usernames in data.get("user_monitored", {}).items()})
+                PER_USER_LIMITS.update(data.get("limits", {}))
+                AUTHORIZED_USERS.update(set(data.get("authorized_users", [])))
+                LATEST_DB_MESSAGE_ID = pinned_message.get("message_id")
 
-                    print(f"[✅] Successfully restored data from message ID {LATEST_DB_MESSAGE_ID}")
-                    return
-
-        print("[!] No db.json found in the channel history returned by Telegram.")
+            print(f"[✅] Successfully restored data from pinned message ID {LATEST_DB_MESSAGE_ID}")
+        else:
+            print("[!] Pinned message does not contain a valid db.json file.")
 
     except Exception as e:
         print(f"[!] An exception occurred while trying to load data: {e}")
@@ -175,7 +178,7 @@ def get_user_data_from_api(username):
         return {"uuid": None, "last_online_unix": None}
 
 def get_all_monitored_usernames():
-    # Helper to get a consistent snapshot of all usernames being monitored
+    """Helper to get a consistent snapshot of all usernames being monitored."""
     all_usernames = set()
     for usernames_set in user_monitored.values():
         all_usernames.update(usernames_set)
@@ -185,46 +188,59 @@ def get_all_monitored_usernames():
 def monitor_loop():
     while True:
         try:
+            # 1. Identify users needing a UUID without holding the lock for long
+            users_needing_uuid = []
             with STATE_LOCK:
-                # Get a snapshot of usernames to monitor for this cycle
-                usernames_to_check = get_all_monitored_usernames()
-                if not usernames_to_check:
+                all_usernames = get_all_monitored_usernames()
+                if not all_usernames:
                     time.sleep(CHECK_INTERVAL)
                     continue
-
-                # 1. Fetch missing UUIDs and initial data
-                for username in list(usernames_to_check): # Use list to allow removal
+                for username in all_usernames:
                     if username not in user_uuids:
-                        data = get_user_data_from_api(username)
-                        if data and data["uuid"]:
-                            user_uuids[username] = data["uuid"]
-                            user_last_seen_unix[username] = data["last_online_unix"]
-                            print(f"[INFO] Fetched UUID for {username}")
-                        else:
-                            print(f"[WARN] Could not fetch UUID for {username}. Skipping for now.")
-                            # Cannot check this user without a UUID
-                            usernames_to_check.remove(username)
-                
-                # 2. Batch-fetch presence data for all users with UUIDs
-                uuids_to_check = [user_uuids[u] for u in usernames_to_check if u in user_uuids]
-                if not uuids_to_check:
-                    time.sleep(CHECK_INTERVAL)
-                    continue
+                        users_needing_uuid.append(username)
 
-                presence_url = f"https://www.chess.com/service/presence/users?ids={','.join(uuids_to_check)}"
-                presence_resp = requests.get(presence_url, headers=HEADERS, timeout=10)
-                
-                if presence_resp.status_code != 200:
-                    print(f"[!] Presence API failed with status {presence_resp.status_code}")
-                    time.sleep(CHECK_INTERVAL)
-                    continue
-                
-                presence_data = {user['userId']: user for user in presence_resp.json().get("users", [])}
-                
-                # Reverse map from uuid back to username
+            # 2. Fetch missing UUIDs and initial data (NETWORK CALLS OUTSIDE LOCK)
+            new_uuid_data = {}
+            if users_needing_uuid:
+                for username in users_needing_uuid:
+                    data = get_user_data_from_api(username)
+                    if data and data["uuid"]:
+                        new_uuid_data[username] = data
+                        print(f"[INFO] Fetched UUID for {username}")
+                    else:
+                        print(f"[WARN] Could not fetch UUID for {username}. Will retry.")
+            
+            # 3. Update shared state with newly fetched UUIDs
+            if new_uuid_data:
+                with STATE_LOCK:
+                    for username, data in new_uuid_data.items():
+                        user_uuids[username] = data["uuid"]
+                        user_last_seen_unix[username] = data["last_online_unix"]
+            
+            # 4. Batch-fetch presence data for all users we have UUIDs for
+            uuids_to_check = []
+            with STATE_LOCK:
+                # We get a fresh list of usernames in case any were removed
+                current_usernames = get_all_monitored_usernames()
+                uuids_to_check = [user_uuids[u] for u in current_usernames if u in user_uuids]
+
+            if not uuids_to_check:
+                time.sleep(CHECK_INTERVAL)
+                continue
+
+            presence_url = f"https://www.chess.com/service/presence/users?ids={','.join(uuids_to_check)}"
+            presence_resp = requests.get(presence_url, headers=HEADERS, timeout=10)
+            
+            if presence_resp.status_code != 200:
+                print(f"[!] Presence API failed with status {presence_resp.status_code}")
+                time.sleep(CHECK_INTERVAL)
+                continue
+            
+            presence_data = {user['userId']: user for user in presence_resp.json().get("users", [])}
+            
+            # 5. Process results and send notifications (MODIFYING STATE INSIDE LOCK)
+            with STATE_LOCK:
                 uuid_to_username = {v: k for k, v in user_uuids.items()}
-
-                # 3. Process results and send notifications
                 for uuid, presence in presence_data.items():
                     username = uuid_to_username.get(uuid)
                     if not username: continue
@@ -232,26 +248,27 @@ def monitor_loop():
                     new_status = presence.get("status")
                     previous_status = user_last_status.get(username)
 
+                    # Notify when user comes ONLINE
                     if new_status == "online" and previous_status != "online":
-                        # Find all users monitoring this username and notify them
                         for user_id, monitored_set in user_monitored.items():
                             if username in monitored_set:
-                                msg = f"♟️ {username} is now ONLINE\nLast seen: {convert_unix_to_ist(user_last_seen_unix.get(username))}"
-                                send_telegram_message(msg, user_id)
+                                safe_username = escape_markdown(username)
+                                last_seen_str = convert_unix_to_ist(user_last_seen_unix.get(username))
+                                msg = f"♟️ `{safe_username}` is now *ONLINE*\nLast seen: {escape_markdown(last_seen_str)}"
+                                send_telegram_message(msg, user_id, "MarkdownV2")
                     
-                    # Update the last known status and last online time
-                    user_last_status[username] = new_status
-                    if new_status != 'online': # Update last seen time when they go offline
+                    # Update last seen time only when user goes OFFLINE
+                    elif new_status != "online" and previous_status == "online":
                         user_data = get_user_data_from_api(username)
                         if user_data and user_data['last_online_unix']:
                             user_last_seen_unix[username] = user_data['last_online_unix']
-
+                    
+                    user_last_status[username] = new_status
 
         except Exception as e:
             print(f"[!!!] CRITICAL ERROR in monitor_loop: {e}")
 
         time.sleep(CHECK_INTERVAL)
-
 
 # === COMMAND HANDLER ===
 def handle_commands():
@@ -286,19 +303,20 @@ def handle_commands():
                         
                         elif text.startswith("/unauthorize"):
                             parts = text.split()
-                            if len(parts) == 2 and parts[1] in AUTHORIZED_USERS:
+                            if len(parts) == 2:
                                 user_to_remove = parts[1]
                                 with STATE_LOCK:
-                                    AUTHORIZED_USERS.remove(user_to_remove)
-                                    # Full cleanup
-                                    user_monitored.pop(user_to_remove, None)
-                                    save_user_data()
-                                send_telegram_message("❌ User unauthorized and data cleaned.", chat_id)
+                                    if user_to_remove in AUTHORIZED_USERS:
+                                        AUTHORIZED_USERS.remove(user_to_remove)
+                                        user_monitored.pop(user_to_remove, None)
+                                        save_user_data()
+                                        send_telegram_message("❌ User unauthorized and data cleaned.", chat_id)
+                                    else:
+                                        send_telegram_message("User not found in authorized list.", chat_id)
 
-                    # Check authorization for user commands
+                    # Check authorization for all other commands
                     if user_id not in AUTHORIZED_USERS:
-                        if user_id != BOT_ADMIN_ID:
-                            send_telegram_message("🚫 You are not authorized to use this bot.", chat_id)
+                        send_telegram_message("🚫 You are not authorized to use this bot.", chat_id)
                         continue
 
                     # User commands
@@ -316,7 +334,7 @@ def handle_commands():
                                 else:
                                     current_set.add(username)
                                     save_user_data()
-                                    send_telegram_message(f"✅ Username `{username}` added to your monitoring list.", chat_id, "MarkdownV2")
+                                    send_telegram_message(f"✅ Username `{escape_markdown(username)}` added.", chat_id, "MarkdownV2")
                         else:
                             send_telegram_message("Usage: /add <username>", chat_id)
 
@@ -333,7 +351,7 @@ def handle_commands():
                                         user_last_status.pop(username, None)
                                         user_last_seen_unix.pop(username, None)
                                     save_user_data()
-                                    send_telegram_message(f"✅ Username `{username}` removed.", chat_id, "MarkdownV2")
+                                    send_telegram_message(f"✅ Username `{escape_markdown(username)}` removed.", chat_id, "MarkdownV2")
                                 else:
                                     send_telegram_message("❌ Username not found in your list.", chat_id)
                         else:
@@ -345,24 +363,25 @@ def handle_commands():
                         if not monitored_list:
                             send_telegram_message("You are not monitoring any users.", chat_id)
                         else:
-                            msg = "Monitoring the following users:\n" + "\n".join([f"- `{u}`" for u in monitored_list])
+                            msg_list = [f"\\- `{escape_markdown(u)}`" for u in monitored_list]
+                            msg = "Monitoring the following users:\n" + "\n".join(msg_list)
                             send_telegram_message(msg, chat_id, "MarkdownV2")
                     
                     elif text.startswith("/status"):
-                        lines = ["♟️ **Player Status**\n"]
+                        lines = ["♟️ *Player Status*"]
                         with STATE_LOCK:
                             monitored_list = sorted(list(user_monitored.get(user_id, set())))
                             if not monitored_list:
-                                send_telegram_message("You are not monitoring any users. Use /add <username> to start.", chat_id)
+                                send_telegram_message("You aren't monitoring anyone. Use `/add <username>` to start.", chat_id, "MarkdownV2")
                                 continue
 
                             for username in monitored_list:
                                 status = user_last_status.get(username, "UNKNOWN").upper()
+                                status_icon = "🟢" if status == "ONLINE" else "⚫️"
                                 last_seen = convert_unix_to_ist(user_last_seen_unix.get(username))
-                                lines.append(f"• **{username}**: {status} \n  (Last Seen: {last_seen})")
+                                lines.append(f"\\- `{escape_markdown(username)}`: {status_icon} *{status}*\n  (Last Seen: {escape_markdown(last_seen)})")
                         
-                        send_telegram_message("\n".join(lines), chat_id, "Markdown")
-
+                        send_telegram_message("\n\n".join(lines), chat_id, "MarkdownV2")
 
         except Exception as e:
             print(f"[!] Command loop error: {e}")
@@ -374,6 +393,11 @@ if __name__ == "__main__":
         raise ValueError("BOT_TOKEN and BOT_ADMIN_ID environment variables must be set.")
     
     load_user_data()
+    
+    # Ensure the admin is always authorized
+    with STATE_LOCK:
+        if BOT_ADMIN_ID:
+            AUTHORIZED_USERS.add(BOT_ADMIN_ID)
     
     # Start background threads
     threading.Thread(target=monitor_loop, daemon=True).start()
