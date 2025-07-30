@@ -103,15 +103,26 @@ def load_user_data():
     print("[INFO] Attempting to load data from Telegram channel...")
 
     if not DB_CHANNEL_ID:
-        print("[WARN] DB_CHANNEL_ID not set. Skipping data load.")
+        print("[WARN] CRITICAL: DB_CHANNEL_ID environment variable is not set or empty. Skipping data load.")
         return
 
     try:
-        # Get channel history to find the last db.json
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getChatHistory?chat_id={DB_CHANNEL_ID}&limit=100"
+        print(f"[DEBUG] Using Channel ID: {DB_CHANNEL_ID}")
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getChatHistory?chat_id={DB_CHANNEL_ID}&limit=10"
         resp = requests.get(url, timeout=10).json()
 
-        if "result" in resp:
+        # --- THIS IS THE CRUCIAL DEBUGGING PART ---
+        print("--- START TELEGRAM API RESPONSE ---")
+        import json
+        print(json.dumps(resp, indent=2))
+        print("--- END TELEGRAM API RESPONSE ---")
+        # -----------------------------------------
+
+        if resp.get("ok") and "result" in resp:
+            if not resp["result"]:
+                print("[!] API call was successful, but the 'result' from Telegram is an empty list. No messages were returned.")
+                return
+
             for message in resp["result"]:
                 doc = message.get("document")
                 if doc and doc.get("file_name") == "db.json":
@@ -135,10 +146,10 @@ def load_user_data():
                     print(f"[✅] Successfully restored data from message ID {LATEST_DB_MESSAGE_ID}")
                     return
 
-        print("[!] No db.json found in the last 100 messages of the Telegram channel history.")
+        print("[!] No db.json found in the channel history returned by Telegram.")
 
     except Exception as e:
-        print(f"[!] Failed to load data from Telegram channel: {e}")
+        print(f"[!] An exception occurred while trying to load data: {e}")
 
 def convert_unix_to_ist(unix_timestamp):
     if not unix_timestamp: return "Unknown"
